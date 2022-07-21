@@ -1,0 +1,261 @@
+#!/bin/bash
+# NOTE: To activate a SLURM option, remove the whitespace between the '#' and 'SBATCH'
+
+# To give your job a name, replace "MyJob" with an appropriate name
+#SBATCH --job-name=biscuitX10
+
+# To set a project account for credit charging, 
+#SBATCH --account=bd17
+
+# Request CPU resource for a serial job
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=36
+
+# Memory usage (MB)
+# SBATCH --mem-per-cpu=4000
+#SBATCH --mem=150000
+
+# Set your minimum acceptable walltime, format: day-hours:minutes:seconds
+# SBATCH --qos=irq
+#SBATCH --time=5-0:00:00
+
+# To receive an email when job completes or fails
+#SBATCH --mail-user=scott.maxwell1@monash.edu
+#SBATCH --mail-type=END
+#SBATCH --mail-type=FAIL
+#SBATCH --mail-type=BEGIN
+
+# SBATCH --array=1-1%1
+#SBATCH --array=1-10%10
+
+# Set the file for output (stdout)
+#SBATCH --output=/scratch/bd17/smaxwell/prophecy/log/biscuitX10-%j.out
+
+# Set the file for error log (stderr)
+#SBATCH --error=/scratch/bd17/smaxwell/prophecy/log/biscuitX10-%j.err
+
+
+# Use reserved node to run job when a node reservation is made for you already
+# SBATCH --reservation=epigenetics
+
+#SBATCH --partition=comp
+# SBATCH --gres=gpu:V100:1
+
+# SBATCH --dependency=afterok:26685578
+
+# Command to run a serial job
+
+########################################
+########################################
+
+#Prepare Ref and working dir 
+########################################
+
+WDIR=/scratch/bd17/smaxwell/prophecy
+RAWDATA=$WDIR/raw_fastq/wgbs
+REFDIR=$WDIR/refgenome
+BISCDIR=$WDIR/refgenome/biscuit
+DATA_DIR=$WDIR/WGBS
+FQMGDIR=${RAWDATA}/merged
+TLOGDIR=${FQMGDIR}/TLOG
+
+REF_GENOME_URL="http://ftp.ensembl.org/pub/release-104/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz"
+REF_GENOME=$REFDIR/$(basename $REF_GENOME_URL .gz)
+BISC_GENOME=$BISCDIR/$(basename $REF_GENOME_URL .gz)
+REF_CHECK=REFcomplete.txt
+BISC_REF_CHECK=REFcomplete_biscuit.txt
+
+REF_GTF_URL="http://ftp.ensembl.org/pub/release-104/gtf/homo_sapiens/Homo_sapiens.GRCh38.104.gtf.gz"
+REF_GTF=$REFDIR/$(basename $REF_GTF_URL .gz)
+REF_NAMEGTF=$(basename $REF_GTF_URL .gtf.gz)
+REF_SPECIES=$(basename $REF_GTF_URL | sed 's#\..*##')
+
+TRIM=$WDIR/refgenome/adapter_trim.fa.txt
+
+export PATH=$PATH:/scratch/bd17/smaxwell/prophecy/software/BISCUIT:/scratch/bd17/smaxwell/prophecy/software/samblaster
+
+if [ ! -e $REFDIR ] ; then
+mkdir $REFDIR
+fi
+
+cd $REFDIR
+
+if [ ! -r $REF_CHECK ] ; then
+  touch $REF_CHECK
+  wget -N $REF_GENOME_URL
+  gunzip -f $REF_GENOME.gz
+  wget -N $REF_GTF_URL
+  gunzip -f $REF_GTF.gz
+fi
+
+if [ ! -e $BISCDIR ] ; then
+mkdir $BISCDIR
+fi
+
+cd $BISCDIR
+
+module unload gcc
+
+if [ ! -r $BISC_REF_CHECK ] ; then
+  touch $BISC_REF_CHECK
+  ln -s $REF_GENOME .
+  module load samtools
+  biscuit index $(basename $REF_GENOME)
+  touch IDXcomplete.txt 
+fi
+
+module unload gcc/5.4.0
+
+if [ ! -e $DATA_DIR ] ; then
+mkdir $DATA_DIR
+fi
+
+if [ ! -e $FQMGDIR ] ; then
+mkdir $FQMGDIR
+fi
+
+if [ ! -e $TLOGDIR ] ; then
+mkdir $TLOGDIR
+fi
+
+cd $FQMGDIR
+
+sleep $SLURM_ARRAY_TASK_ID
+if [ ! -r RFQ.txt ] ; then
+ls -v $RAWDATA/*1.fq.gz | sed 's#_FDLM.*##' | sort -u > RFQ.txt
+fi
+
+# Select sample to process by array task id
+RFQ1=$(cat RFQ.txt | awk -v line=$(expr $SLURM_ARRAY_TASK_ID + 0)  '{if (NR == line) print $0}')
+name=$( echo $RFQ1 | sed 's#.*\/##' )
+
+
+# Merge sample fastqs if split
+module load pigz
+if [ ! -r $TLOGDIR/${name}_complete ] ; then
+module load gnuparallel/20220322
+if [ $(ls ${RFQ1}_*1.fq.gz | wc -l) == 1 ] ; then
+parallel ::: "ln -s ${RFQ1}_*1.fq.gz $FQMGDIR/${name}_R1.fq.gz" \
+"ln -s ${RFQ1}_*2.fq.gz $FQMGDIR/${name}_R2.fq.gz"
+else
+parallel ::: "zcat ${RFQ1}_*1.fq.gz | pigz > $FQMGDIR/${name}_R1.fq.gz" \
+"zcat ${RFQ1}_*2.fq.gz | pigz > $FQMGDIR/${name}_R2.fq.gz"
+fi
+touch $TLOGDIR/${name}_complete
+fi
+
+
+R1=$FQMGDIR/${name}_R1.fq.gz
+R2=$FQMGDIR/${name}_R2.fq.gz
+R3=$name
+R4=${R3}-trimmed-pair1.fastq.gz
+R5=${R3}-trimmed-pair2.fastq.gz
+
+cd $DATA_DIR 
+
+if [ ! -r $R3.finished ] ; then
+
+module unload  'gcc/8.1.0'
+
+# RUN SKEWER
+if [ ! -r $R3.trim.complete ] ; then
+#if false ; then
+module load skewer
+skewer -t $SLURM_CPUS_ON_NODE -q 20 -x $TRIM $R1 $R2 -z -o ${R3}
+module unload skewer
+touch $R3.trim.complete
+#rm $R1 $R2
+fi
+
+# Ref indexed check
+while [ ! -r $BISCDIR/IDXcomplete.txt ] ; do
+echo waiting
+sleep 600
+done
+
+# Sample trim output check
+while [ ! -r $R3.trim.complete ] ; do
+echo waiting
+sleep 600
+done
+
+
+# RUN BISCUIT
+module load samtools
+if [ ! -r $R3.bisc.complete ] ; then
+rm -f temp_${name}*
+biscuit align -@ $SLURM_CPUS_ON_NODE $BISC_GENOME $R4 $R5 | samblaster --addMateTags | samtools sort -@5 -m 5000M -T temp_${name} -O "bam" -o ${R3}.bisc.bam 
+touch $R3.bisc.complete
+#rm $R4 $R5
+fi
+
+if [ ! -r $R3.index.complete ] ; then
+samtools index -@ $SLURM_CPUS_ON_NODE ${R3}.bisc.bam
+touch $R3.index.complete
+fi
+
+if [ ! -r $R3.stats.complete ] ; then
+samtools flagstat -@ $SLURM_CPUS_ON_NODE ${R3}.bisc.bam > ${R3}.bisc.bam.flagstats
+touch $R3.index.complete
+fi
+
+#EXTRACT METHYLATION DATA
+if [ ! -r $R3.methyl.complete ] ; then
+module load pigz
+BAM=${R3}.bisc.bam
+VCFZ=$(echo $BAM | sed 's/.bam/.vcf.gz/')
+BEDZ=$(echo $BAM | sed 's/.bam/.bed.gz/')
+BED=$(echo $BAM | sed 's/.bam/.bed/')
+MK=$(echo $BAM | sed 's/.bam/.mk.bed/')
+biscuit pileup -@ $SLURM_CPUS_ON_NODE $BISC_GENOME $BAM | bgzip -c > $VCFZ
+tabix -p vcf $VCFZ
+biscuit vcf2bed -k 5 -t cg $VCFZ | pigz > $BEDZ
+# biseq format
+zcat $BEDZ \
+| awk '{OFS="\t"} {printf "%s\t%i\t%i\t%4.3f\t%.0f\t%.0f\n",  $1,$2,$3,$4,$5*$4,$5-($5*$4)}' \
+> $BED
+# methylkit format
+zcat $BEDZ \
+| awk '{OFS="\t"} {printf "%s.%i-%i\t%s\t%i-%i\t%s\t%i\t%.3f\t%.3f\n",  $1,$2,$3,$1,$2,$3,"+",  $5 , $4*100 , 100-($4*100) }' \
+> $MK
+touch $R3.methyl.complete
+fi
+
+if [ ! -r $R3.qc.complete ] ; then
+module unload gcc/5.4.0
+module load bedtools
+
+bash $WDIR/software/BISCUIT/QC.sh -v $VCFZ $BISCDIR/assets $BISC_GENOME ${R3} ${R3}.bisc.bam
+touch $R3.qc.complete
+fi
+
+touch $R3.finished
+#rm $R3.*.complete
+fi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
