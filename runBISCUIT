@@ -1,0 +1,170 @@
+#!/bin/bash
+
+###############################################
+# Load configuration
+###############################################
+source config.env
+
+###############################################
+# SLURM SETTINGS
+###############################################
+#SBATCH --job-name=biscuit_wgbs
+#SBATCH --cpus-per-task=$THREADS
+#SBATCH --mem=$MEMORY
+#SBATCH --time=5-00:00:00
+#SBATCH --mail-user=$EMAIL
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --array=1-10%10
+#SBATCH --output=$WDIR/logs/biscuit-%j.out
+#SBATCH --error=$WDIR/logs/biscuit-%j.err
+
+###############################################
+# PATH setup (modules OR binaries)
+###############################################
+export PATH=$PATH:$BISCUIT_BIN:$SAMBLASTER_BIN
+
+###############################################
+# Create directories
+###############################################
+mkdir -p $REFDIR $BISCDIR $DATA_DIR $FQMGDIR $TLOGDIR
+
+###############################################
+# Download reference genome if missing
+###############################################
+cd $REFDIR
+
+if [ ! -f REFcomplete.txt ]; then
+    touch REFcomplete.txt
+    wget -N $REF_GENOME_URL
+    gunzip -f $(basename $REF_GENOME_URL)
+    wget -N $REF_GTF_URL
+    gunzip -f $(basename $REF_GTF_URL)
+fi
+
+###############################################
+# BISCUIT reference indexing
+###############################################
+cd $BISCDIR
+REF_GENOME=$REFDIR/$(basename $REF_GENOME_URL .gz)
+
+if [ ! -f REFcomplete_biscuit.txt ]; then
+    touch REFcomplete_biscuit.txt
+    ln -sf $REF_GENOME .
+    $SAMTOOLS_BIN faidx $(basename $REF_GENOME)
+    biscuit index $(basename $REF_GENOME)
+    touch IDXcomplete.txt
+fi
+
+###############################################
+# Build FASTQ list
+###############################################
+cd $FQMGDIR
+
+if [ ! -f RFQ.txt ]; then
+    ls -v $RAWDATA/*1.fq.gz | sed 's#_FDLM.*##' | sort -u > RFQ.txt
+fi
+
+###############################################
+# Select sample for this array task
+###############################################
+RFQ1=$(awk -v line=$SLURM_ARRAY_TASK_ID 'NR==line {print}' RFQ.txt)
+name=$(basename $RFQ1)
+
+###############################################
+# Merge FASTQs if needed
+###############################################
+if [ ! -f $TLOGDIR/${name}_complete ]; then
+    if [ $(ls ${RFQ1}_*1.fq.gz | wc -l) == 1 ]; then
+        ln -sf ${RFQ1}_*1.fq.gz $FQMGDIR/${name}_R1.fq.gz
+        ln -sf ${RFQ1}_*2.fq.gz $FQMGDIR/${name}_R2.fq.gz
+    else
+        zcat ${RFQ1}_*1.fq.gz | $PIGZ_BIN > $FQMGDIR/${name}_R1.fq.gz
+        zcat ${RFQ1}_*2.fq.gz | $PIGZ_BIN > $FQMGDIR/${name}_R2.fq.gz
+    fi
+    touch $TLOGDIR/${name}_complete
+fi
+
+###############################################
+# Trimming
+###############################################
+cd $DATA_DIR
+
+R1=$FQMGDIR/${name}_R1.fq.gz
+R2=$FQMGDIR/${name}_R2.fq.gz
+
+if [ ! -f ${name}.trim.complete ]; then
+    $SKEWER_BIN -t $THREADS -q 20 -x $TRIM $R1 $R2 -z -o $name
+    touch ${name}.trim.complete
+fi
+
+###############################################
+# Wait for BISCUIT index
+###############################################
+while [ ! -f $BISCDIR/IDXcomplete.txt ]; do
+    sleep 300
+done
+
+###############################################
+# Alignment
+###############################################
+if [ ! -f ${name}.bisc.complete ]; then
+    biscuit align -@ $THREADS $BISCDIR/$(basename $REF_GENOME) \
+        ${name}-trimmed-pair1.fastq.gz \
+        ${name}-trimmed-pair2.fastq.gz \
+        | samblaster --addMateTags \
+        | $SAMTOOLS_BIN sort -@ 5 -m 5G -o ${name}.bisc.bam
+    touch ${name}.bisc.complete
+fi
+
+###############################################
+# Index BAM
+###############################################
+if [ ! -f ${name}.index.complete ]; then
+    $SAMTOOLS_BIN index -@ $THREADS ${name}.bisc.bam
+    touch ${name}.index.complete
+fi
+
+###############################################
+# Flagstats
+###############################################
+if [ ! -f ${name}.stats.complete ]; then
+    $SAMTOOLS_BIN flagstat -@ $THREADS ${name}.bisc.bam > ${name}.flagstats
+    touch ${name}.stats.complete
+fi
+
+###############################################
+# Methylation extraction
+###############################################
+if [ ! -f ${name}.methyl.complete ]; then
+    BAM=${name}.bisc.bam
+    VCFZ=${name}.vcf.gz
+    BEDZ=${name}.bed.gz
+    BED=${name}.bed
+    MK=${name}.mk.bed
+
+    biscuit pileup -@ $THREADS $BISCDIR/$(basename $REF_GENOME) $BAM \
+        | $BGZIP_BIN -c > $VCFZ
+
+    $TABIX_BIN -p vcf $VCFZ
+
+    biscuit vcf2bed -k 5 -t cg $VCFZ | $PIGZ_BIN > $BEDZ
+
+    # biseq format
+    zcat $BEDZ | awk '{OFS="\t"} {printf "%s\t%i\t%i\t%4.3f\t%.0f\t%.0f\n",$1,$2,$3,$4,$5*$4,$5-($5*$4)}' > $BED
+
+    # methylKit format
+    zcat $BEDZ | awk '{OFS="\t"} {printf "%s.%i-%i\t%s\t%i-%i\t+\t%i\t%.3f\t%.3f\n",$1,$2,$3,$1,$2,$3,$5,$4*100,100-($4*100)}' > $MK
+
+    touch ${name}.methyl.complete
+fi
+
+###############################################
+# QC
+###############################################
+if [ ! -f ${name}.qc.complete ]; then
+    bash $WDIR/software/BISCUIT/QC.sh -v $VCFZ $BISCDIR/assets \
+        $BISCDIR/$(basename $REF_GENOME) $name ${name}.bisc.bam
+    touch ${name}.qc.complete
+fi
+
+touch ${name}.finished
