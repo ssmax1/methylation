@@ -8,10 +8,12 @@ All configuration is handled through a single `config.env` file, making the work
 
 ## Repository structure
 
-BISCUIT/
-├── runBISCUIT            # Main SLURM pipeline script
-├── BISCUIT_config.env    # User-editable configuration file
-└── README.md             # This file
+```text
+methylation/BISCUIT/
+├── runBISCUIT           # Main SLURM pipeline script
+├── BISCUIT_config.env   # User-editable configuration file
+└── README.md            # This file
+```
 
 ---
 
